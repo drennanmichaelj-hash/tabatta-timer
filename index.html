@@ -214,8 +214,6 @@
   }
 
   /* phase theming */
-  body.work { --theme: var(--accent); }
-  body.break { --theme: var(--break); }
   body.work .countdown, body.work .phase-label { color: var(--accent); }
   body.break .countdown, body.break .phase-label { color: var(--break); }
   body.work .progress-bar { background: var(--accent); }
@@ -229,6 +227,7 @@
     color: var(--muted);
     font-size: 0.8rem;
     margin-top: 18px;
+    line-height: 1.5;
   }
 
   @media (max-width: 380px) {
@@ -275,7 +274,8 @@
 
       <button class="btn start" id="startBtn">Start</button>
     </div>
-    <p class="hint">Audio cues play on every transition. Make sure your volume is up.</p>
+    <p class="hint">Audio cues play on every transition &mdash; turn your volume up.<br>
+    Cues keep playing if you switch apps or lock the screen.</p>
   </div>
 
   <!-- TIMER SCREEN -->
@@ -333,17 +333,46 @@
   wireToggle(breakUnitEl, function (u) { breakUnit = u; });
 
   // ---------- Audio (Web Audio API) ----------
+  // Strategy for background playback: the timer is fully deterministic, so we
+  // pre-schedule every upcoming beep on the Web Audio clock. Scheduled tones
+  // play on the audio thread and keep firing even when the page is backgrounded
+  // and JS is frozen. A silent looping source keeps the audio session alive.
   var audioCtx = null;
+  var keepAliveSrc = null;
+  var scheduledNodes = new Set();   // entries: { osc, gain }
+  var HORIZON = 3600;               // seconds of cues to pre-schedule
+  var MAX_EVENTS = 1500;            // safety cap on scheduled nodes
+
   function ensureAudio() {
     if (!audioCtx) {
       var AC = window.AudioContext || window.webkitAudioContext;
       if (AC) audioCtx = new AC();
+      startKeepAlive();
     }
     if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
   }
-  function tone(freq, duration, type, when, volume) {
+
+  function startKeepAlive() {
+    if (!audioCtx || keepAliveSrc) return;
+    try {
+      // 1 second of pure silence, looped forever -> keeps the context "running"
+      var buf = audioCtx.createBuffer(1, audioCtx.sampleRate, audioCtx.sampleRate);
+      var src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.loop = true;
+      var g = audioCtx.createGain();
+      g.gain.value = 0;
+      src.connect(g);
+      g.connect(audioCtx.destination);
+      src.start();
+      keepAliveSrc = src;
+    } catch (e) {}
+  }
+
+  // Schedule one tone at an absolute AudioContext time.
+  function toneAt(freq, duration, type, when, volume) {
     if (!audioCtx) return;
-    var t0 = (when || audioCtx.currentTime);
+    var t0 = when;
     var osc = audioCtx.createOscillator();
     var gain = audioCtx.createGain();
     osc.type = type || 'sine';
@@ -355,145 +384,179 @@
     osc.connect(gain);
     gain.connect(audioCtx.destination);
     osc.start(t0);
-    osc.stop(t0 + duration + 0.02);
-  }
-  // short beep at a normal transition
-  function beepTransition() {
-    ensureAudio();
-    tone(880, 0.15, 'sine');
-  }
-  // a slightly different beep when a workout begins (higher, double)
-  function beepWorkStart() {
-    ensureAudio();
-    if (!audioCtx) return;
-    var now = audioCtx.currentTime;
-    tone(660, 0.12, 'square', now, 0.3);
-    tone(990, 0.15, 'square', now + 0.14, 0.3);
-  }
-  // distinct longer ascending tone when a full rotation completes
-  function fanfareRotation() {
-    ensureAudio();
-    if (!audioCtx) return;
-    var now = audioCtx.currentTime;
-    var notes = [523.25, 659.25, 783.99, 1046.5]; // C E G C
-    notes.forEach(function (f, i) {
-      tone(f, 0.28, 'triangle', now + i * 0.16, 0.4);
-    });
+    osc.stop(t0 + duration + 0.05);
+    var entry = { osc: osc, gain: gain };
+    scheduledNodes.add(entry);
+    osc.onended = function () {
+      try { osc.disconnect(); gain.disconnect(); } catch (e) {}
+      scheduledNodes.delete(entry);
+    };
   }
 
-  // ---------- Timer state ----------
+  // Cue families (each takes an absolute ctx start time)
+  function cueWorkStart(when) {                 // workout begins: rising double beep
+    toneAt(660, 0.12, 'square', when, 0.3);
+    toneAt(990, 0.15, 'square', when + 0.14, 0.3);
+  }
+  function cueBreak(when) {                      // break begins: single beep
+    toneAt(880, 0.15, 'sine', when, 0.35);
+  }
+  function cueFanfare(when) {                    // full rotation complete: ascending C-E-G-C
+    var notes = [523.25, 659.25, 783.99, 1046.5];
+    for (var i = 0; i < notes.length; i++) toneAt(notes[i], 0.28, 'triangle', when + i * 0.16, 0.4);
+  }
+
+  // Silence every scheduled cue (used on pause/reset/reschedule). We can't call
+  // stop() twice, so we mute the gain instead; the nodes still stop on schedule.
+  function clearScheduled() {
+    if (!audioCtx) { scheduledNodes.clear(); return; }
+    var now = audioCtx.currentTime;
+    scheduledNodes.forEach(function (entry) {
+      try {
+        entry.gain.gain.cancelScheduledValues(now);
+        entry.gain.gain.setValueAtTime(0.0001, now);
+      } catch (e) {}
+    });
+    scheduledNodes.clear();
+  }
+
+  // ---------- Timer state (wall-clock anchored) ----------
   var state = {
     numWorkouts: 3,
     workSec: 30,
     breakSec: 10,
-    rotation: 1,
-    completedRotations: 0,
-    // sequence index: phases are built per rotation
-    phaseIndex: 0,
-    phases: [],        // array of {type:'work'|'break', label, sub, seconds}
-    remaining: 0,
-    phaseTotal: 0,
+    pdArr: [],          // phase durations for one rotation: [work, break, work, break, ...]
+    cycleLen: 0,        // seconds in one full rotation
+    elapsedBase: 0,     // elapsed seconds accumulated before the current running segment
+    startPerf: 0,       // performance.now() when the current running segment began
     running: false,
     paused: false,
-    lastTick: 0,
     rafId: null
   };
 
-  function buildPhases() {
-    var phases = [];
-    for (var i = 1; i <= state.numWorkouts; i++) {
-      phases.push({
-        type: 'work',
-        label: 'Workout ' + i,
-        sub: 'of ' + state.numWorkouts + ' workouts',
-        seconds: state.workSec
-      });
-      phases.push({
-        type: 'break',
-        label: 'Break',
-        sub: (i < state.numWorkouts)
-          ? 'next: Workout ' + (i + 1)
-          : 'finishing rotation',
-        seconds: state.breakSec
-      });
+  function buildDurations() {
+    var arr = [];
+    for (var i = 0; i < state.numWorkouts; i++) {
+      arr.push(state.workSec);
+      arr.push(state.breakSec);
     }
-    return phases;
+    return arr;
+  }
+
+  function currentElapsed() {
+    if (!state.running || state.paused) return state.elapsedBase;
+    return state.elapsedBase + (performance.now() - state.startPerf) / 1000;
+  }
+
+  // Resolve which phase a given elapsed time falls in.
+  function phaseAt(E) {
+    var arr = state.pdArr, L = arr.length, cyc = state.cycleLen;
+    var r = Math.floor(E / cyc);
+    var rem = E - r * cyc;
+    var acc = 0, li = 0;
+    for (li = 0; li < L; li++) {
+      if (rem < acc + arr[li]) break;
+      acc += arr[li];
+    }
+    if (li >= L) { li = L - 1; acc = cyc - arr[li]; }
+    var startAbs = r * cyc + acc;
+    var dur = arr[li];
+    return {
+      rotation: r + 1,
+      completed: r,
+      globalIndex: r * L + li,
+      isWork: (li % 2 === 0),
+      workoutNumber: Math.floor(li / 2) + 1,
+      duration: dur,
+      remaining: Math.max(0, (startAbs + dur) - E),
+      phaseEndAbs: startAbs + dur
+    };
   }
 
   function fmt(totalSeconds) {
-    var s = Math.max(0, Math.ceil(totalSeconds));
+    var s = Math.max(0, Math.ceil(totalSeconds - 1e-6));
     var m = Math.floor(s / 60);
     var ss = s % 60;
     return (m < 10 ? '0' : '') + m + ':' + (ss < 10 ? '0' : '') + ss;
   }
 
-  function nextPhasePreview() {
-    var ni = state.phaseIndex + 1;
-    if (ni < state.phases.length) {
-      return 'Up next: ' + state.phases[ni].label;
-    }
-    return 'Up next: Rotation ' + (state.rotation + 1) + ' — Workout 1';
+  function nextHintText(p) {
+    if (p.isWork) return 'Up next: Break';
+    if (p.workoutNumber < state.numWorkouts) return 'Up next: Workout ' + (p.workoutNumber + 1);
+    return 'Up next: Rotation ' + (p.rotation + 1) + ' — Workout 1';
   }
 
-  function render() {
-    var p = state.phases[state.phaseIndex];
-    rotationNumEl.textContent = state.rotation;
-    completedNumEl.textContent = state.completedRotations;
-    phaseLabelEl.textContent = p.label;
-    phaseSubEl.textContent = p.sub;
-    countdownEl.textContent = fmt(state.remaining);
-    var pct = state.phaseTotal > 0 ? (state.remaining / state.phaseTotal) * 100 : 0;
-    progressBarEl.style.width = Math.max(0, Math.min(100, pct)) + '%';
-    nextHintEl.textContent = nextPhasePreview();
-
-    document.body.classList.toggle('work', p.type === 'work');
-    document.body.classList.toggle('break', p.type === 'break');
-  }
-
-  function enterPhase(index, playCue) {
-    state.phaseIndex = index;
-    var p = state.phases[index];
-    state.phaseTotal = p.seconds;
-    state.remaining = p.seconds;
-    if (playCue) {
-      if (p.type === 'work') beepWorkStart();
-      else beepTransition();
-    }
-    render();
-  }
-
-  function advance() {
-    var nextIndex = state.phaseIndex + 1;
-    if (nextIndex >= state.phases.length) {
-      // full rotation complete
-      state.completedRotations += 1;
-      state.rotation += 1;
-      fanfareRotation();
-      state.phases = buildPhases();
-      enterPhase(0, false); // fanfare already played; work-start beep would overlap, skip
-      render();
-    } else {
-      enterPhase(nextIndex, true);
-    }
-  }
-
-  function loop(now) {
-    if (!state.running) return;
-    if (!state.paused) {
-      var dt = (now - state.lastTick) / 1000;
-      state.lastTick = now;
-      state.remaining -= dt;
-      if (state.remaining <= 0) {
-        advance();
+  // Pre-schedule all transition cues within the horizon, starting from elapsed
+  // value fromE (which must correspond to "now").
+  function scheduleCues(fromE) {
+    if (!audioCtx) return;
+    clearScheduled();
+    var arr = state.pdArr, L = arr.length;
+    var ctxNow = audioCtx.currentTime;
+    var cur = phaseAt(fromE);
+    var gi = cur.globalIndex + 1;        // index of phase that STARTS at next boundary
+    var boundaryAbs = cur.phaseEndAbs;   // elapsed seconds at that boundary
+    var count = 0;
+    while ((boundaryAbs - fromE) <= HORIZON && count < MAX_EVENTS) {
+      var when = ctxNow + (boundaryAbs - fromE);
+      if (when > ctxNow + 0.02) {
+        var li = ((gi % L) + L) % L;
+        if (li === 0)            cueFanfare(when);   // new rotation begins
+        else if (li % 2 === 0)   cueWorkStart(when); // workout begins
+        else                     cueBreak(when);     // break begins
+        boundaryAbs += arr[li];
       } else {
-        render();
+        boundaryAbs += arr[((gi % L) + L) % L];
       }
-    } else {
-      state.lastTick = now;
+      gi += 1;
+      count += 1;
     }
-    state.rafId = requestAnimationFrame(loop);
   }
 
+  // ---------- Rendering ----------
+  function render() {
+    var p = phaseAt(currentElapsed());
+    rotationNumEl.textContent = p.rotation;
+    completedNumEl.textContent = p.completed;
+    if (p.isWork) {
+      phaseLabelEl.textContent = 'Workout ' + p.workoutNumber;
+      phaseSubEl.textContent = 'of ' + state.numWorkouts + ' workouts';
+    } else {
+      phaseLabelEl.textContent = 'Break';
+      phaseSubEl.textContent = (p.workoutNumber < state.numWorkouts)
+        ? 'next: Workout ' + (p.workoutNumber + 1)
+        : 'finishing rotation';
+    }
+    countdownEl.textContent = fmt(p.remaining);
+    var pct = p.duration > 0 ? (p.remaining / p.duration) * 100 : 0;
+    progressBarEl.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    nextHintEl.textContent = nextHintText(p);
+    document.body.classList.toggle('work', p.isWork);
+    document.body.classList.toggle('break', !p.isWork);
+  }
+
+  function tick() {
+    if (!state.running) return;
+    if (!state.paused) render();
+    state.rafId = requestAnimationFrame(tick);
+  }
+
+  // ---------- Wake Lock (keeps screen on while in foreground) ----------
+  var wakeLock = null;
+  function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+        navigator.wakeLock.request('screen').then(function (wl) {
+          wakeLock = wl;
+        }).catch(function () {});
+      }
+    } catch (e) {}
+  }
+  function releaseWakeLock() {
+    try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) {}
+  }
+
+  // ---------- Controls ----------
   function startTimer() {
     var n = parseInt(numWorkoutsEl.value, 10);
     var w = parseFloat(workDurEl.value);
@@ -506,33 +569,49 @@
     state.numWorkouts = Math.floor(n);
     state.workSec  = Math.round(workUnit  === 'min' ? w * 60 : w);
     state.breakSec = Math.round(breakUnit === 'min' ? b * 60 : b);
-    state.rotation = 1;
-    state.completedRotations = 0;
-    state.phases = buildPhases();
+    state.pdArr = buildDurations();
+    state.cycleLen = state.pdArr.reduce(function (a, c) { return a + c; }, 0);
+    state.elapsedBase = 0;
+    state.startPerf = performance.now();
+    state.running = true;
+    state.paused = false;
 
     ensureAudio();
 
     setupScreen.classList.remove('active');
     timerScreen.classList.add('active');
-
-    enterPhase(0, true);
-    state.running = true;
-    state.paused = false;
     pauseBtn.textContent = 'Pause';
     document.body.classList.remove('paused');
-    state.lastTick = performance.now();
+
+    requestWakeLock();
+    if (audioCtx) cueWorkStart(audioCtx.currentTime + 0.05); // beep for workout 1
+    scheduleCues(0);
+    render();
+
     cancelAnimationFrame(state.rafId);
-    state.rafId = requestAnimationFrame(loop);
+    state.rafId = requestAnimationFrame(tick);
   }
 
   function togglePause() {
     if (!state.running) return;
-    state.paused = !state.paused;
-    pauseBtn.textContent = state.paused ? 'Resume' : 'Pause';
-    document.body.classList.toggle('paused', state.paused);
     if (!state.paused) {
+      // pausing
+      state.elapsedBase = currentElapsed();
+      state.paused = true;
+      clearScheduled();
+      pauseBtn.textContent = 'Resume';
+      document.body.classList.add('paused');
+      releaseWakeLock();
+    } else {
+      // resuming
       ensureAudio();
-      state.lastTick = performance.now();
+      state.startPerf = performance.now();
+      state.paused = false;
+      pauseBtn.textContent = 'Pause';
+      document.body.classList.remove('paused');
+      requestWakeLock();
+      scheduleCues(state.elapsedBase);
+      render();
     }
   }
 
@@ -540,17 +619,29 @@
     state.running = false;
     state.paused = false;
     cancelAnimationFrame(state.rafId);
+    clearScheduled();
+    releaseWakeLock();
     document.body.classList.remove('work', 'break', 'paused');
     timerScreen.classList.remove('active');
     setupScreen.classList.add('active');
   }
+
+  // ---------- Background / foreground handling ----------
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && state.running && !state.paused) {
+      // Re-sync the display to real elapsed time and refill the cue horizon.
+      ensureAudio();
+      scheduleCues(currentElapsed());
+      render();
+      requestWakeLock();
+    }
+  });
 
   // ---------- Events ----------
   startBtn.addEventListener('click', startTimer);
   pauseBtn.addEventListener('click', togglePause);
   resetBtn.addEventListener('click', reset);
 
-  // keyboard convenience: space = pause/resume on timer screen
   document.addEventListener('keydown', function (e) {
     if (e.code === 'Space' && timerScreen.classList.contains('active')) {
       e.preventDefault();
