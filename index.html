@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Tabata Timer</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2430;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #3fb950;
+    --accent-2: #2ea043;
+    --break: #58a6ff;
+    --rest-glow: rgba(88,166,255,0.25);
+    --work-glow: rgba(63,185,80,0.25);
+    --danger: #f85149;
+    --border: #30363d;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 20px;
+    transition: background 0.4s ease;
+  }
+
+  .screen {
+    width: 100%;
+    max-width: 460px;
+    display: none;
+  }
+  .screen.active { display: block; }
+
+  h1 {
+    text-align: center;
+    font-size: 1.8rem;
+    margin: 0 0 4px;
+    letter-spacing: 0.5px;
+  }
+  .subtitle {
+    text-align: center;
+    color: var(--muted);
+    margin: 0 0 28px;
+    font-size: 0.95rem;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 22px;
+  }
+
+  .field { margin-bottom: 20px; }
+  .field:last-child { margin-bottom: 0; }
+
+  label {
+    display: block;
+    font-size: 0.9rem;
+    color: var(--muted);
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+
+  .input-row {
+    display: flex;
+    gap: 10px;
+  }
+
+  input[type="number"] {
+    flex: 1;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 1.2rem;
+    padding: 14px;
+    border-radius: 10px;
+    width: 100%;
+    outline: none;
+    transition: border-color 0.2s;
+    -moz-appearance: textfield;
+  }
+  input[type="number"]:focus { border-color: var(--accent); }
+  input::-webkit-outer-spin-button,
+  input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+  .unit-toggle {
+    display: flex;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .unit-toggle button {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    padding: 0 16px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+  }
+  .unit-toggle button.sel {
+    background: var(--accent);
+    color: #08130b;
+  }
+
+  .btn {
+    width: 100%;
+    border: none;
+    border-radius: 12px;
+    padding: 18px;
+    font-size: 1.1rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.08s, background 0.2s, opacity 0.2s;
+    color: #08130b;
+    background: var(--accent);
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn.start { margin-top: 24px; }
+
+  .btn-row {
+    display: flex;
+    gap: 12px;
+    margin-top: 28px;
+  }
+  .btn-secondary {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-danger {
+    background: transparent;
+    color: var(--danger);
+    border: 1px solid var(--danger);
+  }
+
+  /* Timer screen */
+  #timerScreen .card {
+    text-align: center;
+    padding: 30px 22px;
+  }
+
+  .rotation-badge {
+    display: inline-block;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 8px 18px;
+    font-size: 0.95rem;
+    color: var(--muted);
+    margin-bottom: 22px;
+  }
+  .rotation-badge b {
+    color: var(--text);
+    font-size: 1.1rem;
+  }
+
+  .phase-label {
+    font-size: 2rem;
+    font-weight: 800;
+    margin: 0 0 6px;
+    letter-spacing: 1px;
+    transition: color 0.3s;
+  }
+  .phase-sub {
+    color: var(--muted);
+    margin: 0 0 18px;
+    font-size: 0.9rem;
+    min-height: 1.2em;
+  }
+
+  .countdown {
+    font-size: 6rem;
+    font-weight: 800;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    margin: 10px 0 22px;
+    letter-spacing: 2px;
+  }
+
+  .progress {
+    height: 8px;
+    background: var(--panel-2);
+    border-radius: 999px;
+    overflow: hidden;
+    margin-bottom: 6px;
+  }
+  .progress-bar {
+    height: 100%;
+    width: 100%;
+    background: var(--accent);
+    border-radius: 999px;
+    transition: width 0.25s linear, background 0.3s;
+  }
+
+  /* phase theming */
+  body.work { --theme: var(--accent); }
+  body.break { --theme: var(--break); }
+  body.work .countdown, body.work .phase-label { color: var(--accent); }
+  body.break .countdown, body.break .phase-label { color: var(--break); }
+  body.work .progress-bar { background: var(--accent); }
+  body.break .progress-bar { background: var(--break); }
+  body.work .card { box-shadow: 0 0 50px var(--work-glow); }
+  body.break .card { box-shadow: 0 0 50px var(--rest-glow); }
+  body.paused .countdown { opacity: 0.45; }
+
+  .hint {
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.8rem;
+    margin-top: 18px;
+  }
+
+  @media (max-width: 380px) {
+    .countdown { font-size: 4.5rem; }
+    .phase-label { font-size: 1.6rem; }
+  }
+</style>
+</head>
+<body>
+
+  <!-- SETUP SCREEN -->
+  <div id="setupScreen" class="screen active">
+    <h1>Tabata Timer</h1>
+    <p class="subtitle">Set it up, hit start, keep moving.</p>
+    <div class="card">
+      <div class="field">
+        <label for="numWorkouts">Workouts per rotation</label>
+        <div class="input-row">
+          <input type="number" id="numWorkouts" min="1" step="1" value="3" inputmode="numeric">
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="workDur">Workout duration</label>
+        <div class="input-row">
+          <input type="number" id="workDur" min="1" step="1" value="30" inputmode="numeric">
+          <div class="unit-toggle" id="workUnit">
+            <button data-unit="sec" class="sel">sec</button>
+            <button data-unit="min">min</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="breakDur">Break duration</label>
+        <div class="input-row">
+          <input type="number" id="breakDur" min="1" step="1" value="10" inputmode="numeric">
+          <div class="unit-toggle" id="breakUnit">
+            <button data-unit="sec" class="sel">sec</button>
+            <button data-unit="min">min</button>
+          </div>
+        </div>
+      </div>
+
+      <button class="btn start" id="startBtn">Start</button>
+    </div>
+    <p class="hint">Audio cues play on every transition. Make sure your volume is up.</p>
+  </div>
+
+  <!-- TIMER SCREEN -->
+  <div id="timerScreen" class="screen">
+    <div class="card">
+      <div class="rotation-badge">Rotation <b id="rotationNum">1</b> &nbsp;·&nbsp; Completed: <b id="completedNum">0</b></div>
+      <div class="phase-label" id="phaseLabel">Workout 1</div>
+      <div class="phase-sub" id="phaseSub">of 3 workouts</div>
+      <div class="countdown" id="countdown">00:30</div>
+      <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="btn-row">
+        <button class="btn btn-secondary" id="pauseBtn">Pause</button>
+        <button class="btn btn-danger" id="resetBtn">Reset</button>
+      </div>
+      <p class="hint" id="nextHint"></p>
+    </div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------- DOM ----------
+  var setupScreen   = document.getElementById('setupScreen');
+  var timerScreen   = document.getElementById('timerScreen');
+  var numWorkoutsEl = document.getElementById('numWorkouts');
+  var workDurEl     = document.getElementById('workDur');
+  var breakDurEl    = document.getElementById('breakDur');
+  var workUnitEl    = document.getElementById('workUnit');
+  var breakUnitEl   = document.getElementById('breakUnit');
+  var startBtn      = document.getElementById('startBtn');
+
+  var rotationNumEl  = document.getElementById('rotationNum');
+  var completedNumEl = document.getElementById('completedNum');
+  var phaseLabelEl   = document.getElementById('phaseLabel');
+  var phaseSubEl     = document.getElementById('phaseSub');
+  var countdownEl    = document.getElementById('countdown');
+  var progressBarEl  = document.getElementById('progressBar');
+  var pauseBtn       = document.getElementById('pauseBtn');
+  var resetBtn       = document.getElementById('resetBtn');
+  var nextHintEl     = document.getElementById('nextHint');
+
+  // ---------- Unit toggles ----------
+  var workUnit = 'sec', breakUnit = 'sec';
+  function wireToggle(container, setter) {
+    container.addEventListener('click', function (e) {
+      var btn = e.target.closest('button');
+      if (!btn) return;
+      Array.prototype.forEach.call(container.children, function (c) { c.classList.remove('sel'); });
+      btn.classList.add('sel');
+      setter(btn.getAttribute('data-unit'));
+    });
+  }
+  wireToggle(workUnitEl,  function (u) { workUnit = u; });
+  wireToggle(breakUnitEl, function (u) { breakUnit = u; });
+
+  // ---------- Audio (Web Audio API) ----------
+  var audioCtx = null;
+  function ensureAudio() {
+    if (!audioCtx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audioCtx = new AC();
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }
+  function tone(freq, duration, type, when, volume) {
+    if (!audioCtx) return;
+    var t0 = (when || audioCtx.currentTime);
+    var osc = audioCtx.createOscillator();
+    var gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    var vol = volume == null ? 0.35 : volume;
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(vol, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(t0);
+    osc.stop(t0 + duration + 0.02);
+  }
+  // short beep at a normal transition
+  function beepTransition() {
+    ensureAudio();
+    tone(880, 0.15, 'sine');
+  }
+  // a slightly different beep when a workout begins (higher, double)
+  function beepWorkStart() {
+    ensureAudio();
+    if (!audioCtx) return;
+    var now = audioCtx.currentTime;
+    tone(660, 0.12, 'square', now, 0.3);
+    tone(990, 0.15, 'square', now + 0.14, 0.3);
+  }
+  // distinct longer ascending tone when a full rotation completes
+  function fanfareRotation() {
+    ensureAudio();
+    if (!audioCtx) return;
+    var now = audioCtx.currentTime;
+    var notes = [523.25, 659.25, 783.99, 1046.5]; // C E G C
+    notes.forEach(function (f, i) {
+      tone(f, 0.28, 'triangle', now + i * 0.16, 0.4);
+    });
+  }
+
+  // ---------- Timer state ----------
+  var state = {
+    numWorkouts: 3,
+    workSec: 30,
+    breakSec: 10,
+    rotation: 1,
+    completedRotations: 0,
+    // sequence index: phases are built per rotation
+    phaseIndex: 0,
+    phases: [],        // array of {type:'work'|'break', label, sub, seconds}
+    remaining: 0,
+    phaseTotal: 0,
+    running: false,
+    paused: false,
+    lastTick: 0,
+    rafId: null
+  };
+
+  function buildPhases() {
+    var phases = [];
+    for (var i = 1; i <= state.numWorkouts; i++) {
+      phases.push({
+        type: 'work',
+        label: 'Workout ' + i,
+        sub: 'of ' + state.numWorkouts + ' workouts',
+        seconds: state.workSec
+      });
+      phases.push({
+        type: 'break',
+        label: 'Break',
+        sub: (i < state.numWorkouts)
+          ? 'next: Workout ' + (i + 1)
+          : 'finishing rotation',
+        seconds: state.breakSec
+      });
+    }
+    return phases;
+  }
+
+  function fmt(totalSeconds) {
+    var s = Math.max(0, Math.ceil(totalSeconds));
+    var m = Math.floor(s / 60);
+    var ss = s % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (ss < 10 ? '0' : '') + ss;
+  }
+
+  function nextPhasePreview() {
+    var ni = state.phaseIndex + 1;
+    if (ni < state.phases.length) {
+      return 'Up next: ' + state.phases[ni].label;
+    }
+    return 'Up next: Rotation ' + (state.rotation + 1) + ' — Workout 1';
+  }
+
+  function render() {
+    var p = state.phases[state.phaseIndex];
+    rotationNumEl.textContent = state.rotation;
+    completedNumEl.textContent = state.completedRotations;
+    phaseLabelEl.textContent = p.label;
+    phaseSubEl.textContent = p.sub;
+    countdownEl.textContent = fmt(state.remaining);
+    var pct = state.phaseTotal > 0 ? (state.remaining / state.phaseTotal) * 100 : 0;
+    progressBarEl.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    nextHintEl.textContent = nextPhasePreview();
+
+    document.body.classList.toggle('work', p.type === 'work');
+    document.body.classList.toggle('break', p.type === 'break');
+  }
+
+  function enterPhase(index, playCue) {
+    state.phaseIndex = index;
+    var p = state.phases[index];
+    state.phaseTotal = p.seconds;
+    state.remaining = p.seconds;
+    if (playCue) {
+      if (p.type === 'work') beepWorkStart();
+      else beepTransition();
+    }
+    render();
+  }
+
+  function advance() {
+    var nextIndex = state.phaseIndex + 1;
+    if (nextIndex >= state.phases.length) {
+      // full rotation complete
+      state.completedRotations += 1;
+      state.rotation += 1;
+      fanfareRotation();
+      state.phases = buildPhases();
+      enterPhase(0, false); // fanfare already played; work-start beep would overlap, skip
+      render();
+    } else {
+      enterPhase(nextIndex, true);
+    }
+  }
+
+  function loop(now) {
+    if (!state.running) return;
+    if (!state.paused) {
+      var dt = (now - state.lastTick) / 1000;
+      state.lastTick = now;
+      state.remaining -= dt;
+      if (state.remaining <= 0) {
+        advance();
+      } else {
+        render();
+      }
+    } else {
+      state.lastTick = now;
+    }
+    state.rafId = requestAnimationFrame(loop);
+  }
+
+  function startTimer() {
+    var n = parseInt(numWorkoutsEl.value, 10);
+    var w = parseFloat(workDurEl.value);
+    var b = parseFloat(breakDurEl.value);
+
+    if (!n || n < 1) { alert('Enter at least 1 workout per rotation.'); return; }
+    if (!w || w <= 0) { alert('Enter a valid workout duration.'); return; }
+    if (!b || b <= 0) { alert('Enter a valid break duration.'); return; }
+
+    state.numWorkouts = Math.floor(n);
+    state.workSec  = Math.round(workUnit  === 'min' ? w * 60 : w);
+    state.breakSec = Math.round(breakUnit === 'min' ? b * 60 : b);
+    state.rotation = 1;
+    state.completedRotations = 0;
+    state.phases = buildPhases();
+
+    ensureAudio();
+
+    setupScreen.classList.remove('active');
+    timerScreen.classList.add('active');
+
+    enterPhase(0, true);
+    state.running = true;
+    state.paused = false;
+    pauseBtn.textContent = 'Pause';
+    document.body.classList.remove('paused');
+    state.lastTick = performance.now();
+    cancelAnimationFrame(state.rafId);
+    state.rafId = requestAnimationFrame(loop);
+  }
+
+  function togglePause() {
+    if (!state.running) return;
+    state.paused = !state.paused;
+    pauseBtn.textContent = state.paused ? 'Resume' : 'Pause';
+    document.body.classList.toggle('paused', state.paused);
+    if (!state.paused) {
+      ensureAudio();
+      state.lastTick = performance.now();
+    }
+  }
+
+  function reset() {
+    state.running = false;
+    state.paused = false;
+    cancelAnimationFrame(state.rafId);
+    document.body.classList.remove('work', 'break', 'paused');
+    timerScreen.classList.remove('active');
+    setupScreen.classList.add('active');
+  }
+
+  // ---------- Events ----------
+  startBtn.addEventListener('click', startTimer);
+  pauseBtn.addEventListener('click', togglePause);
+  resetBtn.addEventListener('click', reset);
+
+  // keyboard convenience: space = pause/resume on timer screen
+  document.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' && timerScreen.classList.contains('active')) {
+      e.preventDefault();
+      togglePause();
+    }
+  });
+})();
+</script>
+</body>
+</html>
