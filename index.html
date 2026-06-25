@@ -332,92 +332,153 @@
   wireToggle(workUnitEl,  function (u) { workUnit = u; });
   wireToggle(breakUnitEl, function (u) { breakUnit = u; });
 
-  // ---------- Audio (Web Audio API) ----------
-  // Strategy for background playback: the timer is fully deterministic, so we
-  // pre-schedule every upcoming beep on the Web Audio clock. Scheduled tones
-  // play on the audio thread and keep firing even when the page is backgrounded
-  // and JS is frozen. A silent looping source keeps the audio session alive.
-  var audioCtx = null;
-  var keepAliveSrc = null;
-  var scheduledNodes = new Set();   // entries: { osc, gain }
-  var HORIZON = 3600;               // seconds of cues to pre-schedule
-  var MAX_EVENTS = 1500;            // safety cap on scheduled nodes
+  // ---------- Audio (background-safe via a looping media element) ----------
+  // Mobile browsers SUSPEND the Web Audio API the moment the page is
+  // backgrounded, so live-scheduled beeps go silent off-screen. An <audio>
+  // media element, however, keeps playing in the background. Because every
+  // rotation is identical, we render one rotation's worth of beeps (offline)
+  // into a single WAV track and loop it, kept in sync with the timeline.
+  var audioEl = null;
+  var audioURL = null;
+  var BASE_SR = 16000;          // sample rate for the rendered track
+  var MAX_SAMPLES = 8000000;    // cap track size (~16 MB) for very long rotations
 
-  function ensureAudio() {
-    if (!audioCtx) {
-      var AC = window.AudioContext || window.webkitAudioContext;
-      if (AC) audioCtx = new AC();
-      startKeepAlive();
+  function ensureAudioEl() {
+    if (!audioEl) {
+      audioEl = new Audio();
+      audioEl.loop = true;
+      audioEl.preload = 'auto';
+      audioEl.setAttribute('playsinline', '');
     }
-    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
   }
 
-  function startKeepAlive() {
-    if (!audioCtx || keepAliveSrc) return;
+  // Must run inside a user gesture: starts a looping silent clip so the OS
+  // grants this element background-audio permission before the real track loads.
+  function unlockAudio() {
+    ensureAudioEl();
     try {
-      // 1 second of pure silence, looped forever -> keeps the context "running"
-      var buf = audioCtx.createBuffer(1, audioCtx.sampleRate, audioCtx.sampleRate);
-      var src = audioCtx.createBufferSource();
-      src.buffer = buf;
-      src.loop = true;
-      var g = audioCtx.createGain();
-      g.gain.value = 0;
-      src.connect(g);
-      g.connect(audioCtx.destination);
-      src.start();
-      keepAliveSrc = src;
+      if (!audioEl.src) {
+        audioURL = encodeWAVURL(new Float32Array(Math.floor(BASE_SR * 0.05)), BASE_SR);
+        audioEl.src = audioURL;
+      }
+      audioEl.loop = true;
+      var p = audioEl.play();
+      if (p && p.catch) p.catch(function () {});
     } catch (e) {}
   }
 
-  // Schedule one tone at an absolute AudioContext time.
-  function toneAt(freq, duration, type, when, volume) {
-    if (!audioCtx) return;
-    var t0 = when;
-    var osc = audioCtx.createOscillator();
-    var gain = audioCtx.createGain();
+  // Encode mono Float32 PCM samples into a WAV object URL.
+  function encodeWAVURL(samples, sr) {
+    var len = samples.length;
+    var dataSize = len * 2;
+    var ab = new ArrayBuffer(44 + dataSize);
+    var dv = new DataView(ab);
+    function wstr(off, s) { for (var i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); }
+    wstr(0, 'RIFF'); dv.setUint32(4, 36 + dataSize, true); wstr(8, 'WAVE');
+    wstr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    wstr(36, 'data'); dv.setUint32(40, dataSize, true);
+    var off = 44;
+    for (var i = 0; i < len; i++) {
+      var s = Math.max(-1, Math.min(1, samples[i]));
+      dv.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      off += 2;
+    }
+    return URL.createObjectURL(new Blob([ab], { type: 'audio/wav' }));
+  }
+
+  // --- Offline tone rendering (used only to build the looping track) ---
+  function renderTone(ctx, freq, duration, type, when, volume) {
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
     osc.type = type || 'sine';
     osc.frequency.value = freq;
     var vol = volume == null ? 0.35 : volume;
-    gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(vol, t0 + 0.01);
-    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start(t0);
-    osc.stop(t0 + duration + 0.05);
-    var entry = { osc: osc, gain: gain };
-    scheduledNodes.add(entry);
-    osc.onended = function () {
-      try { osc.disconnect(); gain.disconnect(); } catch (e) {}
-      scheduledNodes.delete(entry);
-    };
+    gain.gain.setValueAtTime(0.0001, when);
+    gain.gain.exponentialRampToValueAtTime(vol, when + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, when + duration);
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.start(when); osc.stop(when + duration + 0.05);
   }
-
-  // Cue families (each takes an absolute ctx start time)
-  function cueWorkStart(when) {                 // workout begins: rising double beep
-    toneAt(660, 0.12, 'square', when, 0.3);
-    toneAt(990, 0.15, 'square', when + 0.14, 0.3);
+  function renderWorkStart(ctx, when) {            // workout begins: rising double beep
+    renderTone(ctx, 660, 0.12, 'square', when, 0.3);
+    renderTone(ctx, 990, 0.15, 'square', when + 0.14, 0.3);
   }
-  function cueBreak(when) {                      // break begins: single beep
-    toneAt(880, 0.15, 'sine', when, 0.35);
+  function renderBreak(ctx, when) {                 // break begins: single beep
+    renderTone(ctx, 880, 0.15, 'sine', when, 0.35);
   }
-  function cueFanfare(when) {                    // full rotation complete: ascending C-E-G-C
+  function renderFanfare(ctx, when) {               // rotation complete: ascending C-E-G-C
     var notes = [523.25, 659.25, 783.99, 1046.5];
-    for (var i = 0; i < notes.length; i++) toneAt(notes[i], 0.28, 'triangle', when + i * 0.16, 0.4);
+    for (var i = 0; i < notes.length; i++) renderTone(ctx, notes[i], 0.28, 'triangle', when + i * 0.16, 0.4);
   }
 
-  // Silence every scheduled cue (used on pause/reset/reschedule). We can't call
-  // stop() twice, so we mute the gain instead; the nodes still stop on schedule.
-  function clearScheduled() {
-    if (!audioCtx) { scheduledNodes.clear(); return; }
-    var now = audioCtx.currentTime;
-    scheduledNodes.forEach(function (entry) {
-      try {
-        entry.gain.gain.cancelScheduledValues(now);
-        entry.gain.gain.setValueAtTime(0.0001, now);
-      } catch (e) {}
-    });
-    scheduledNodes.clear();
+  // Build the looping rotation track and hand it to the audio element.
+  function buildRotationTrack(done) {
+    var OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OAC) { done(false); return; }
+    var cycleLen = state.cycleLen;
+    var step = state.workSec + state.breakSec;
+    var sr = BASE_SR;
+    if (cycleLen * sr > MAX_SAMPLES) sr = Math.max(8000, Math.floor(MAX_SAMPLES / cycleLen));
+    var frames = Math.max(1, Math.ceil(cycleLen * sr));
+    var ctx;
+    try { ctx = new OAC(1, frames, sr); } catch (e) { done(false); return; }
+
+    for (var i = 0; i < state.numWorkouts; i++) {
+      var wStart = i * step;
+      renderWorkStart(ctx, wStart + 0.0005);        // start of each workout
+      var bStart = wStart + state.workSec;
+      if (bStart < cycleLen) renderBreak(ctx, bStart); // start of each break
+    }
+    // Rotation-complete fanfare lands at the loop boundary; the next loop's
+    // workout-1 beep follows immediately, marking the new rotation.
+    var fanfareLen = 0.8;
+    renderFanfare(ctx, Math.max(0, cycleLen - fanfareLen));
+
+    ctx.startRendering().then(function (buf) {
+      var url = encodeWAVURL(buf.getChannelData(0), buf.sampleRate);
+      if (audioURL) { try { URL.revokeObjectURL(audioURL); } catch (e) {} }
+      audioURL = url;
+      ensureAudioEl();
+      audioEl.src = url;
+      audioEl.loop = true;
+      done(true);
+    }).catch(function () { done(false); });
+  }
+
+  // --- Playback control synced to the timeline ---
+  function audioSeekPlay(elapsed) {
+    if (!audioEl) return;
+    try { audioEl.currentTime = state.cycleLen > 0 ? (elapsed % state.cycleLen) : 0; } catch (e) {}
+    var p = audioEl.play();
+    if (p && p.catch) p.catch(function () {});
+  }
+  function audioResync(elapsed) {
+    if (!audioEl || audioEl.paused || state.cycleLen <= 0) return;
+    var target = elapsed % state.cycleLen;
+    if (Math.abs(audioEl.currentTime - target) > 0.5) {
+      try { audioEl.currentTime = target; } catch (e) {}
+    }
+  }
+  function audioStop() { if (audioEl) { try { audioEl.pause(); } catch (e) {} } }
+
+  // --- MediaSession: lock-screen controls + helps keep playback alive ---
+  function setupMediaSession() {
+    if (!('mediaSession' in navigator)) return;
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: 'Tabata Timer', artist: 'Workout in progress'
+      });
+      navigator.mediaSession.setActionHandler('play', function () {
+        if (state.running && state.paused) togglePause();
+      });
+      navigator.mediaSession.setActionHandler('pause', function () {
+        if (state.running && !state.paused) togglePause();
+      });
+    } catch (e) {}
+  }
+  function setMediaState(s) {
+    if ('mediaSession' in navigator) { try { navigator.mediaSession.playbackState = s; } catch (e) {} }
   }
 
   // ---------- Timer state (wall-clock anchored) ----------
@@ -464,12 +525,10 @@
     return {
       rotation: r + 1,
       completed: r,
-      globalIndex: r * L + li,
       isWork: (li % 2 === 0),
       workoutNumber: Math.floor(li / 2) + 1,
       duration: dur,
-      remaining: Math.max(0, (startAbs + dur) - E),
-      phaseEndAbs: startAbs + dur
+      remaining: Math.max(0, (startAbs + dur) - E)
     };
   }
 
@@ -484,33 +543,6 @@
     if (p.isWork) return 'Up next: Break';
     if (p.workoutNumber < state.numWorkouts) return 'Up next: Workout ' + (p.workoutNumber + 1);
     return 'Up next: Rotation ' + (p.rotation + 1) + ' — Workout 1';
-  }
-
-  // Pre-schedule all transition cues within the horizon, starting from elapsed
-  // value fromE (which must correspond to "now").
-  function scheduleCues(fromE) {
-    if (!audioCtx) return;
-    clearScheduled();
-    var arr = state.pdArr, L = arr.length;
-    var ctxNow = audioCtx.currentTime;
-    var cur = phaseAt(fromE);
-    var gi = cur.globalIndex + 1;        // index of phase that STARTS at next boundary
-    var boundaryAbs = cur.phaseEndAbs;   // elapsed seconds at that boundary
-    var count = 0;
-    while ((boundaryAbs - fromE) <= HORIZON && count < MAX_EVENTS) {
-      var when = ctxNow + (boundaryAbs - fromE);
-      if (when > ctxNow + 0.02) {
-        var li = ((gi % L) + L) % L;
-        if (li === 0)            cueFanfare(when);   // new rotation begins
-        else if (li % 2 === 0)   cueWorkStart(when); // workout begins
-        else                     cueBreak(when);     // break begins
-        boundaryAbs += arr[li];
-      } else {
-        boundaryAbs += arr[((gi % L) + L) % L];
-      }
-      gi += 1;
-      count += 1;
-    }
   }
 
   // ---------- Rendering ----------
@@ -576,7 +608,15 @@
     state.running = true;
     state.paused = false;
 
-    ensureAudio();
+    // Unlock audio synchronously inside this click, then load the real track.
+    unlockAudio();
+    setupMediaSession();
+    buildRotationTrack(function (ok) {
+      if (ok && state.running && !state.paused) {
+        audioSeekPlay(currentElapsed());
+        setMediaState('playing');
+      }
+    });
 
     setupScreen.classList.remove('active');
     timerScreen.classList.add('active');
@@ -584,10 +624,7 @@
     document.body.classList.remove('paused');
 
     requestWakeLock();
-    if (audioCtx) cueWorkStart(audioCtx.currentTime + 0.05); // beep for workout 1
-    scheduleCues(0);
     render();
-
     cancelAnimationFrame(state.rafId);
     state.rafId = requestAnimationFrame(tick);
   }
@@ -598,19 +635,20 @@
       // pausing
       state.elapsedBase = currentElapsed();
       state.paused = true;
-      clearScheduled();
+      audioStop();
+      setMediaState('paused');
       pauseBtn.textContent = 'Resume';
       document.body.classList.add('paused');
       releaseWakeLock();
     } else {
       // resuming
-      ensureAudio();
       state.startPerf = performance.now();
       state.paused = false;
       pauseBtn.textContent = 'Pause';
       document.body.classList.remove('paused');
       requestWakeLock();
-      scheduleCues(state.elapsedBase);
+      audioSeekPlay(state.elapsedBase);
+      setMediaState('playing');
       render();
     }
   }
@@ -619,7 +657,8 @@
     state.running = false;
     state.paused = false;
     cancelAnimationFrame(state.rafId);
-    clearScheduled();
+    audioStop();
+    setMediaState('none');
     releaseWakeLock();
     document.body.classList.remove('work', 'break', 'paused');
     timerScreen.classList.remove('active');
@@ -629,10 +668,9 @@
   // ---------- Background / foreground handling ----------
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'visible' && state.running && !state.paused) {
-      // Re-sync the display to real elapsed time and refill the cue horizon.
-      ensureAudio();
-      scheduleCues(currentElapsed());
+      // Re-sync display and audio to real elapsed time after returning.
       render();
+      audioResync(currentElapsed());
       requestWakeLock();
     }
   });
